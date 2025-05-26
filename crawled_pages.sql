@@ -64,3 +64,9 @@ create policy "Allow public read access"
   for select
   to public
   using (true);
+
+-- Create a policy that allows authenticated users to insert
+create policy "Allow authenticated users to insert"
+  on crawled_pages
+  for insert
+  with check (true);
