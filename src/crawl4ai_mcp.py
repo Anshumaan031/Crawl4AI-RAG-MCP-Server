@@ -113,16 +113,21 @@ def parse_sitemap(sitemap_url: str) -> List[str]:
     Returns:
         List of URLs found in the sitemap
     """
-    resp = requests.get(sitemap_url)
     urls = []
+    try:
+        resp = requests.get(sitemap_url, stream=True)
+        resp.raise_for_status()  # Raise HTTPError for bad responses (4xx or 5xx)
 
-    if resp.status_code == 200:
         try:
-            tree = ElementTree.fromstring(resp.content)
+            # Use iter_content to process the response in chunks
+            tree = ElementTree.parse(resp.raw)
             urls = [loc.text for loc in tree.findall('.//{*}loc')]
-        except Exception as e:
+        except ElementTree.ParseError as e:
             print(f"Error parsing sitemap XML: {e}")
-
+        finally:
+            resp.close()  # Ensure the connection is closed
+    except requests.exceptions.RequestException as e:
+        print(f"Error fetching sitemap {sitemap_url}: {e}")
     return urls
 
 def smart_chunk_markdown(text: str, chunk_size: int = 5000) -> List[str]:
@@ -409,8 +414,17 @@ async def crawl_batch(crawler: AsyncWebCrawler, urls: List[str], max_concurrent:
         max_session_permit=max_concurrent
     )
 
-    results = await crawler.arun_many(urls=urls, config=crawl_config, dispatcher=dispatcher)
-    return [{'url': r.url, 'markdown': r.markdown} for r in results if r.success and r.markdown]
+    results = []
+    for url in urls:
+        try:
+            result = await crawler.arun(url=url, config=crawl_config, dispatcher=dispatcher)
+            if result.success and result.markdown:
+                results.append({'url': result.url, 'markdown': result.markdown})
+            else:
+                print(f"Failed to crawl {url}: {result.error_message}")
+        except Exception as e:
+            print(f"Error crawling {url}: {e}")
+    return results
 
 async def crawl_recursive_internal_links(crawler: AsyncWebCrawler, start_urls: List[str], max_depth: int = 3, max_concurrent: int = 10) -> List[Dict[str, Any]]:
     """
@@ -462,6 +476,9 @@ async def crawl_recursive_internal_links(crawler: AsyncWebCrawler, start_urls: L
         current_urls = next_level_urls
 
     return results_all
+    
+    # Clear the visited set after the crawl is complete
+    visited.clear()
 
 @mcp.tool()
 async def get_available_sources(ctx: Context) -> str:
@@ -577,6 +594,7 @@ async def main():
     transport = os.getenv("TRANSPORT", "sse")
     if transport == 'sse':
         # Run the MCP server with sse transport
+        await asyncio.sleep(1)  # Add a small delay before starting the server
         await mcp.run_sse_async()
     else:
         # Run the MCP server with stdio transport
