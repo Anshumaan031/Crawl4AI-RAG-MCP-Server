@@ -133,29 +133,37 @@ class APIResponse(BaseModel):
 
 # Helper functions (copied from original MCP server)
 def is_sitemap(url: str) -> bool:
-    """Check if a URL is a sitemap."""
-    return url.endswith('sitemap.xml') or 'sitemap' in urlparse(url).path
+    """Check if a URL is a sitemap, supporting both remote and local files."""
+    return url.endswith('sitemap.xml') or 'sitemap' in urlparse(url).path or Path(url).is_file() and url.endswith('sitemap.xml')
 
 def is_txt(url: str) -> bool:
     """Check if a URL is a text file."""
     return url.endswith('.txt')
 
-def parse_sitemap(sitemap_url: str) -> List[str]:
-    """Parse a sitemap and extract URLs."""
+def parse_sitemap(sitemap_path_or_url: str) -> List[str]:
+    """Parse a sitemap and extract URLs, supporting both local files and remote URLs."""
     urls = []
     try:
-        resp = requests.get(sitemap_url, stream=True)
-        resp.raise_for_status()
-
-        try:
-            tree = ElementTree.parse(resp.raw)
-            urls = [loc.text for loc in tree.findall('.//{*}loc')]
-        except ElementTree.ParseError as e:
-            print(f"Error parsing sitemap XML: {e}")
-        finally:
-            resp.close()
+        if Path(sitemap_path_or_url).is_file():
+            # It's a local file
+            with open(sitemap_path_or_url, 'rb') as f:
+                tree = ElementTree.parse(f)
+                urls = [loc.text for loc in tree.findall('.//{*}loc')]
+        else:
+            # Assume it's a URL
+            resp = requests.get(sitemap_path_or_url, stream=True)
+            resp.raise_for_status()
+            try:
+                tree = ElementTree.parse(resp.raw)
+                urls = [loc.text for loc in tree.findall('.//{*}loc')]
+            finally:
+                resp.close()
+    except FileNotFoundError:
+        print(f"Local sitemap file not found: {sitemap_path_or_url}")
+    except ElementTree.ParseError as e:
+        print(f"Error parsing sitemap XML from {sitemap_path_or_url}: {e}")
     except requests.exceptions.RequestException as e:
-        print(f"Error fetching sitemap {sitemap_url}: {e}")
+        print(f"Error fetching sitemap {sitemap_path_or_url}: {e}")
     return urls
 
 def smart_chunk_markdown(text: str, chunk_size: int = 5000) -> List[str]:
@@ -506,8 +514,15 @@ async def rag_query_endpoint(request: RAGQueryRequest):
         # Prepare messages for the Gemini LLM
         # The system message provides the context, and the user message is the query
         messages = [
-            ChatMessage(role="system", content=f"Use the following information to answer the user's question. If the information is not sufficient, state that you cannot answer based on the provided context:\n\n{context}"),
-            ChatMessage(role="user", content=request.query)
+            ChatMessage(role="system", 
+                        content=
+                        f"""
+                        "You are a knowledge expert for Data Security Council of India, NASSCOM. Your task is to provide a direct and precise answer to the user's question about the organization and its activities, based on the provided context:\n\n{context}",
+                        "Do not use conversational intros or phrases like Based on the information provided, According to the context, or The document states.",
+                        "Your The answer must begin directly."""
+                        ),
+            ChatMessage(role="user", 
+                        content=request.query)
         ]
 
         # Call the Gemini LLM
