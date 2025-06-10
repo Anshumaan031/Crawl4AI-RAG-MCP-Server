@@ -18,13 +18,23 @@ def get_supabase_client() -> Client:
     Returns:
         Supabase client instance
     """
-    url = os.getenv("SUPABASE_URL")
-    key = os.getenv("SUPABASE_SERVICE_KEY")
-    
-    if not url or not key:
-        raise ValueError("SUPABASE_URL and SUPABASE_SERVICE_KEY must be set in environment variables")
-    
-    return create_client(url, key)
+    # Prioritize local Supabase environment variables if they exist
+    local_url = os.getenv("SUPABASE_URL_LOCAL")
+    local_key = os.getenv("SUPABASE_SERVICE_KEY_LOCAL")
+
+    if local_url and local_key:
+        print("Connecting to local Supabase instance.")
+        return create_client(local_url, local_key)
+    else:
+        # Fallback to remote Supabase environment variables
+        remote_url = os.getenv("SUPABASE_URL")
+        remote_key = os.getenv("SUPABASE_SERVICE_KEY")
+
+        if not remote_url or not remote_key:
+            raise ValueError("SUPABASE_URL/SUPABASE_SERVICE_KEY or SUPABASE_URL_LOCAL/SUPABASE_SERVICE_KEY_LOCAL must be set in environment variables")
+        
+        print("Connecting to remote Supabase instance.")
+        return create_client(remote_url, remote_key)
 
 def create_embeddings_batch(texts: List[str]) -> List[List[float]]:
     """
