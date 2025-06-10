@@ -1,4 +1,7 @@
 .env
-.venv
+venv
 __pycache__
 crawl4ai_mcp.egg-info
+.clinerules
+docker/.env
+docker/volumes/

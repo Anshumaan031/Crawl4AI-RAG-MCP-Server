@@ -83,6 +83,49 @@ The server provides four essential web crawling and search tools:
 
 5. Create a `.env` file based on the configuration section below
 
+### Running Supabase Locally with Docker (optional)
+
+To run Supabase locally using Docker, follow these steps:
+
+1.  **Get the Supabase code:**
+    ```bash
+    git clone --depth 1 https://github.com/supabase/supabase
+    ```
+
+2.  **Create your new Supabase project directory:**
+    ```bash
+    mkdir supabase-project
+    ```
+
+3.  **Copy the compose files to your project:**
+    ```bash
+    cp -rf supabase/docker/* supabase-project
+    ```
+
+4.  **Copy the fake environment variables:**
+    ```bash
+    cp supabase/docker/.env.example supabase-project/.env
+    ```
+
+5.  **Switch to your project directory:**
+    ```bash
+    cd supabase-project
+    ```
+
+6.  **Pull the latest images:**
+    ```bash
+    docker compose pull
+    ```
+
+7.  **Start the services (in detached mode):**
+    ```bash
+    docker compose up -d
+    ```
+
+After starting Supabase locally, ensure you configure your `.env` file in this project with the correct `SUPABASE_URL` and `SUPABASE_SERVICE_KEY` pointing to your local Supabase instance. Typically, for a local setup, these would be:
+
+
+
 ## Database Setup
 
 Before running the server, you need to set up the database with the pgvector extension:
@@ -109,6 +152,10 @@ OPENAI_API_KEY=your_openai_api_key
 # Supabase Configuration
 SUPABASE_URL=your_supabase_project_url
 SUPABASE_SERVICE_KEY=your_supabase_service_key
+
+#local supbase config
+SUPABASE_URL=your_local_supbase_url
+SUPABASE_SERVICE_KEY=yuut_local_supbase_service_key
 ```
 
 ## Running the Server
