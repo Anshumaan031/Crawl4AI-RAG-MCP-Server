@@ -1,7 +1,8 @@
 """
-FastAPI wrapper for the Crawl4AI MCP server functionality.
+FastAPI wrapper for the Crawl4AI MCP server functionality with PDF processing support.
 
 This module exposes the MCP server tools as REST API endpoints for testing with Postman.
+Now includes support for processing PDF files directly.
 """
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
@@ -19,8 +20,13 @@ import json
 import os
 import re
 import platform
+import tempfile
 from llama_index.core.llms import ChatMessage
 
+# PDF processing imports
+import PyPDF2
+import fitz  # PyMuPDF - better PDF text extraction
+from io import BytesIO
 
 from llama_index.llms.gemini import Gemini
 
@@ -106,17 +112,17 @@ async def lifespan(app: FastAPI):
 # Initialize FastAPI app
 app = FastAPI(
     title="Crawl4AI RAG API",
-    description="REST API for web crawling and RAG queries with Crawl4AI",
-    version="1.0.0",
+    description="REST API for web crawling and RAG queries with Crawl4AI, now with PDF support",
+    version="1.1.0",
     lifespan=lifespan
 )
 
 # Pydantic models for request/response
 class CrawlSinglePageRequest(BaseModel):
-    url: str = Field(..., description="URL of the web page to crawl")
+    url: str = Field(..., description="URL of the web page or PDF to crawl")
 
 class SmartCrawlRequest(BaseModel):
-    url: str = Field(..., description="URL to crawl (can be a regular webpage, sitemap.xml, or .txt file)")
+    url: str = Field(..., description="URL to crawl (can be a regular webpage, sitemap.xml, .txt file, or PDF)")
     max_depth: int = Field(3, description="Maximum recursion depth for regular URLs")
     max_concurrent: int = Field(10, description="Maximum number of concurrent browser sessions")
     chunk_size: int = Field(5000, description="Maximum size of each content chunk in characters")
@@ -130,6 +136,91 @@ class APIResponse(BaseModel):
     success: bool
     data: Optional[Dict[str, Any]] = None
     error: Optional[str] = None
+
+# PDF processing functions
+def is_pdf_url(url: str) -> bool:
+    """Check if a URL points to a PDF file."""
+    return url.lower().endswith('.pdf') or 'pdf' in url.lower()
+
+def extract_text_from_pdf_bytes(pdf_bytes: bytes, method: str = "pymupdf") -> str:
+    """
+    Extract text from PDF bytes using different methods.
+    
+    Args:
+        pdf_bytes: The PDF file as bytes
+        method: Either "pymupdf" (default, better) or "pypdf2" (fallback)
+    
+    Returns:
+        Extracted text as string
+    """
+    text = ""
+    
+    try:
+        if method == "pymupdf":
+            # Using PyMuPDF (fitz) - generally better text extraction
+            pdf_document = fitz.open(stream=pdf_bytes, filetype="pdf")
+            
+            for page_num in range(pdf_document.page_count):
+                page = pdf_document.load_page(page_num)
+                page_text = page.get_text()
+                text += f"\n\n--- Page {page_num + 1} ---\n\n"
+                text += page_text
+                
+            pdf_document.close()
+            
+        elif method == "pypdf2":
+            # Using PyPDF2 as fallback
+            pdf_file = BytesIO(pdf_bytes)
+            pdf_reader = PyPDF2.PdfReader(pdf_file)
+            
+            for page_num, page in enumerate(pdf_reader.pages):
+                page_text = page.extract_text()
+                text += f"\n\n--- Page {page_num + 1} ---\n\n"
+                text += page_text
+                
+    except Exception as e:
+        print(f"Error extracting text from PDF using {method}: {e}")
+        # If primary method fails, try the other one
+        if method == "pymupdf":
+            return extract_text_from_pdf_bytes(pdf_bytes, "pypdf2")
+        else:
+            raise e
+    
+    return text
+
+async def process_pdf_url(url: str) -> Dict[str, Any]:
+    """
+    Download and process a PDF from a URL.
+    
+    Returns:
+        Dict with 'url' and 'markdown' keys, similar to crawler results
+    """
+    try:
+        # Download the PDF
+        response = requests.get(url, timeout=30)
+        response.raise_for_status()
+        
+        # Check if it's actually a PDF
+        content_type = response.headers.get('content-type', '').lower()
+        if 'pdf' not in content_type and not url.lower().endswith('.pdf'):
+            raise ValueError(f"URL does not appear to contain a PDF file. Content-Type: {content_type}")
+        
+        # Extract text from PDF
+        extracted_text = extract_text_from_pdf_bytes(response.content)
+        
+        if not extracted_text.strip():
+            raise ValueError("No text could be extracted from the PDF")
+        
+        return {
+            'url': url,
+            'markdown': extracted_text,
+            'content_type': 'pdf'
+        }
+        
+    except requests.exceptions.RequestException as e:
+        raise ValueError(f"Failed to download PDF: {e}")
+    except Exception as e:
+        raise ValueError(f"Failed to process PDF: {e}")
 
 # Helper functions (copied from original MCP server)
 def is_sitemap(url: str) -> bool:
@@ -241,11 +332,16 @@ async def crawl_batch(crawler: AsyncWebCrawler, urls: List[str], max_concurrent:
     results = []
     for url in urls:
         try:
-            result = await crawler.arun(url=url, config=crawl_config, dispatcher=dispatcher)
-            if result.success and result.markdown:
-                results.append({'url': result.url, 'markdown': result.markdown})
+            # Check if it's a PDF
+            if is_pdf_url(url):
+                pdf_result = await process_pdf_url(url)
+                results.append(pdf_result)
             else:
-                print(f"Failed to crawl {url}: {result.error_message}")
+                result = await crawler.arun(url=url, config=crawl_config, dispatcher=dispatcher)
+                if result.success and result.markdown:
+                    results.append({'url': result.url, 'markdown': result.markdown})
+                else:
+                    print(f"Failed to crawl {url}: {result.error_message}")
         except Exception as e:
             print(f"Error crawling {url}: {e}")
     return results
@@ -296,25 +392,31 @@ async def crawl_recursive_internal_links(crawler: AsyncWebCrawler, start_urls: L
 async def root():
     """Root endpoint with API information."""
     return {
-        "message": "Crawl4AI RAG API",
-        "version": "1.0.0",
+        "message": "Crawl4AI RAG API with PDF Support",
+        "version": "1.1.0",
         "endpoints": {
-            "POST /crawl/single": "Crawl a single web page",
-            "POST /crawl/smart": "Smart crawl based on URL type",
+            "POST /crawl/single": "Crawl a single web page or PDF",
+            "POST /crawl/smart": "Smart crawl based on URL type (now supports PDFs)",
             "POST /query/rag": "Perform RAG query on stored content",
             "GET /sources": "Get available sources"
-        }
+        },
+        "new_features": [
+            "PDF processing support",
+            "Automatic PDF text extraction",
+            "Enhanced content type detection"
+        ]
     }
 
 @app.post("/crawl/single", response_model=APIResponse)
 async def crawl_single_page_endpoint(request: CrawlSinglePageRequest):
     """
-    Crawl a single web page and store its content in Supabase.
+    Crawl a single web page or PDF and store its content in Supabase.
     
-    This endpoint is ideal for quickly retrieving content from a specific URL without following links.
-    The content is stored in Supabase for later retrieval and querying.
+    This endpoint now supports both web pages and PDF files. For PDFs, it will
+    download and extract the text content. The content is stored in Supabase
+    for later retrieval and querying.
     """
-    print("Crawling single page:", request.url)
+    print("Crawling single page/PDF:", request.url)
     if not app_context:
         raise HTTPException(status_code=500, detail="Application context not initialized")
     
@@ -322,16 +424,35 @@ async def crawl_single_page_endpoint(request: CrawlSinglePageRequest):
         crawler = app_context.crawler
         supabase_client = app_context.supabase_client
         
-        # Configure the crawl
-        run_config = CrawlerRunConfig(cache_mode=CacheMode.BYPASS, stream=False)
+        content_result = None
+        content_type = "webpage"
         
-        # Crawl the page
-        result = await crawler.arun(url=request.url, config=run_config)
+        # Check if it's a PDF and handle accordingly
+        if is_pdf_url(request.url):
+            print("Detected PDF URL, processing with PDF extractor...")
+            content_result = await process_pdf_url(request.url)
+            content_type = "pdf"
+        else:
+            # Configure the crawl for regular web pages
+            run_config = CrawlerRunConfig(cache_mode=CacheMode.BYPASS, stream=False)
+            
+            # Crawl the page
+            result = await crawler.arun(url=request.url, config=run_config)
+            
+            if result.success and result.markdown:
+                content_result = {
+                    'url': result.url,
+                    'markdown': result.markdown
+                }
+            else:
+                return APIResponse(
+                    success=False,
+                    error=result.error_message
+                )
         
-        if result.success and result.markdown:
+        if content_result and content_result.get('markdown'):
             # Robustly clean the markdown content before chunking
-            # This helps remove any lingering problematic characters from PDF extraction
-            cleaned_markdown = result.markdown.encode('utf-8', errors='ignore').decode('utf-8')
+            cleaned_markdown = content_result['markdown'].encode('utf-8', errors='ignore').decode('utf-8')
             
             # Chunk the content
             chunks = smart_chunk_markdown(cleaned_markdown)
@@ -352,6 +473,7 @@ async def crawl_single_page_endpoint(request: CrawlSinglePageRequest):
                 meta["chunk_index"] = i
                 meta["url"] = request.url
                 meta["source"] = urlparse(request.url).netloc
+                meta["content_type"] = content_type
                 meta["crawl_time"] = str(asyncio.current_task().get_coro().__name__)
                 metadatas.append(meta)
             
@@ -362,20 +484,22 @@ async def crawl_single_page_endpoint(request: CrawlSinglePageRequest):
                 success=True,
                 data={
                     "url": request.url,
+                    "content_type": content_type,
                     "chunks_stored": len(chunks),
-                    "content_length": len(result.markdown),
+                    "content_length": len(content_result['markdown']),
                     "links_count": {
-                        "internal": len(result.links.get("internal", [])),
-                        "external": len(result.links.get("external", []))
+                        "internal": 0 if content_type == "pdf" else "N/A",
+                        "external": 0 if content_type == "pdf" else "N/A"
                     }
                 }
             )
         else:
             return APIResponse(
                 success=False,
-                error=result.error_message
+                error="No content could be extracted from the URL"
             )
     except Exception as e:
+        print(f"Error in crawl_single_page_endpoint: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/crawl/smart", response_model=APIResponse)
@@ -384,6 +508,7 @@ async def smart_crawl_endpoint(request: SmartCrawlRequest):
     Intelligently crawl a URL based on its type and store content in Supabase.
     
     This endpoint automatically detects the URL type and applies the appropriate crawling method:
+    - For PDFs: Downloads and extracts text content
     - For sitemaps: Extracts and crawls all URLs in parallel
     - For text files (llms.txt): Directly retrieves the content
     - For regular webpages: Recursively crawls internal links up to the specified depth
@@ -401,7 +526,11 @@ async def smart_crawl_endpoint(request: SmartCrawlRequest):
         crawl_type = "webpage"
         
         # Detect URL type and use appropriate crawl method
-        if is_txt(request.url):
+        if is_pdf_url(request.url):
+            pdf_result = await process_pdf_url(request.url)
+            crawl_results = [pdf_result]
+            crawl_type = "pdf"
+        elif is_txt(request.url):
             crawl_results = await crawl_markdown_file(crawler, request.url)
             crawl_type = "text_file"
         elif is_sitemap(request.url):
@@ -450,6 +579,7 @@ async def smart_crawl_endpoint(request: SmartCrawlRequest):
                 meta["url"] = source_url
                 meta["source"] = urlparse(source_url).netloc
                 meta["crawl_type"] = crawl_type
+                meta["content_type"] = doc.get('content_type', 'webpage')
                 meta["crawl_time"] = str(asyncio.current_task().get_coro().__name__)
                 metadatas.append(meta)
                 
@@ -479,7 +609,7 @@ async def rag_query_endpoint(request: RAGQueryRequest):
     
     This endpoint searches the vector database for content relevant to the query,
     uses the matching documents as context, and generates an answer using a Gemini LLM.
-    Optionally filter by source domain.
+    Optionally filter by source domain. Now works with PDF content as well.
     """
     if not app_context:
         raise HTTPException(status_code=500, detail="Application context not initialized")
@@ -520,11 +650,9 @@ async def rag_query_endpoint(request: RAGQueryRequest):
             )
 
         # Combine the context chunks into a single string for the LLM
-        # You might want to add some separators or formatting for clarity
         context = "\n\n".join(context_chunks)
 
         # Prepare messages for the Gemini LLM
-        # The system message provides the context, and the user message is the query
         messages = [
             ChatMessage(role="system", 
                         content=
@@ -554,100 +682,6 @@ async def rag_query_endpoint(request: RAGQueryRequest):
         # Log the exception for debugging purposes
         print(f"Error during RAG query: {e}")
         raise HTTPException(status_code=500, detail=f"An error occurred during the RAG query: {str(e)}")
-
-#previous iteration of rag query that just retrieves chunks 
-
-
-# @app.post("/query/rag", response_model=APIResponse)
-# async def rag_query_endpoint(request: RAGQueryRequest):
-#     """
-#     Perform a RAG (Retrieval Augmented Generation) query on the stored content.
-    
-#     This endpoint searches the vector database for content relevant to the query and returns
-#     the matching documents. Optionally filter by source domain.
-#     """
-#     if not app_context:
-#         raise HTTPException(status_code=500, detail="Application context not initialized")
-    
-#     try:
-#         supabase_client = app_context.supabase_client
-        
-#         # Prepare filter if source is provided and not empty
-#         filter_metadata = None
-#         if request.source and request.source.strip():
-#             filter_metadata = {"source": request.source}
-        
-#         # Perform the search
-#         results = search_documents(
-#             client=supabase_client,
-#             query=request.query,
-#             match_count=request.match_count,
-#             filter_metadata=filter_metadata
-#         )
-
-#         # Format the results
-#         formatted_results = []
-#         for result in results:
-#             formatted_results.append({
-#                 "url": result.get("url"),
-#                 "content": result.get("content"),
-#                 "metadata": result.get("metadata"),
-#                 "similarity": result.get("similarity")
-#             })
-        
-#         return APIResponse(
-#             success=True,
-#             data={
-#                 "query": request.query,
-#                 "source_filter": request.source,
-#                 "results": formatted_results,
-#                 "count": len(formatted_results)
-#             }
-#         )
-
-#         #debugging statement for content from results
-#         # print(f"Search results: {results}")
-        
-#         # # Format the results and extract content
-#         # formatted_results = []
-#         # for result in results:
-#         #     content = result.get("content")
-#         #     if content:
-#         #         formatted_results.append(content)
-
-#         # # Check if there is any content
-#         # if not formatted_results:
-#         #     return APIResponse(
-#         #         success=False,
-#         #         error="No content found for the query"
-#         #     )
-
-#         # # Concatenate the content into a single string
-#         # context = "\\n".join(formatted_results)
-#         # print(f"Context being passed to LLM: {context}")
-
-#         # messages = [
-#         #     ChatMessage(role="system", content=context),
-#         #     ChatMessage(role="user", content=request.query)
-#         # ]
-#         # try:
-#         #     resp = llm.chat(messages)
-#         #     print(f"Raw response from LLM: {resp}")
-
-#         #     # Return the AI-generated response
-#         #     return APIResponse(
-#         #         success=True,
-#         #         data={
-#         #             "query": request.query,
-#         #             "source_filter": request.source,
-#         #             "answer": str(resp.content)
-#         #         }
-#         #     )
-#         # except Exception as e:
-#         #     print(f"Exception during LLM call: {e}")
-#         #     raise HTTPException(status_code=500, detail=str(e))
-#     except Exception as e:
-#         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/sources", response_model=APIResponse)
 async def get_available_sources_endpoint():
