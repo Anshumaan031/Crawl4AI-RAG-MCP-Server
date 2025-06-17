@@ -709,7 +709,9 @@ async def rag_query_endpoint(request: RAGQueryRequest):
                         f"""
                         "You are a knowledge expert for Data Security Council of India, NASSCOM. Your task is to provide a direct and precise answer to the user's question about the organization and its activities, based on the provided context:\n\n{context}",
                         "Do not use conversational intros or phrases like Based on the information provided, According to the context, or The document states.",
-                        "Your The answer must begin directly."""
+                        "Your The answer must begin directly.",
+                        "Try giving longer answers covering all the conxtual infro from the context provided."
+                        """
                         ),
             ChatMessage(role="user", 
                         content=request.query)

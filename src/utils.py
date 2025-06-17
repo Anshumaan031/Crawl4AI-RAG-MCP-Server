@@ -59,9 +59,9 @@ def semantic_chunk_text(text: str, chunk_size: int = 1024, chunk_overlap: int = 
         List of text chunks preserving semantic meaning
     """
     # Check for GOOGLE_API_KEY in env
-    api_key = os.getenv("GOOGLE_API_KEY")
+    api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
-        print("Warning: GOOGLE_API_KEY not found in environment. Semantic chunking will fail.")
+        print("Warning: GEMINI_API_KEY not found in environment. Semantic chunking will fail.")
     
     # Check for OpenAI API key - needed for embeddings
     if not openai.api_key:
