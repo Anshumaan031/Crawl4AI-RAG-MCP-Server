@@ -22,21 +22,29 @@ import re
 import platform
 import tempfile
 from llama_index.core.llms import ChatMessage
+from fastapi_mcp import FastApiMCP
 
 # PDF processing imports
 import PyPDF2
 import fitz  # PyMuPDF - better PDF text extraction
 from io import BytesIO
+from pdf_parser import parse_pdf_to_markdown # Import LlamaParse utility
 
 from llama_index.llms.gemini import Gemini
 
+# Get API key from environment variables instead of hardcoding
+gemini_api_key = os.getenv("GEMINI_API_KEY")
+if not gemini_api_key:
+    print("Warning: GEMINI_API_KEY not found in environment variables. Using default value.")
+    gemini_api_key = "YOUR_API_KEY" # Replace with placeholder instead of real key
+
 llm = Gemini(
     model="models/gemini-2.0-flash",
-    api_key='AIzaSyBiNd7kxQCZl3MbycrNpPkdN7yz79JMmBU'
+    api_key=gemini_api_key
 )
 
 from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig, CacheMode, MemoryAdaptiveDispatcher
-from utils import get_supabase_client, add_documents_to_supabase, search_documents
+from utils import get_supabase_client, add_documents_to_supabase, search_documents, download_pdf_to_temp_file
 
 # Windows-specific asyncio fix
 if platform.system() == "Windows":
@@ -48,6 +56,12 @@ dotenv_path = project_root / '.env'
 
 # Force override of existing environment variables
 load_dotenv(dotenv_path, override=True)
+
+# Set a custom temporary directory within the project root
+custom_temp_dir = project_root / "temp"
+if not custom_temp_dir.exists():
+    custom_temp_dir.mkdir()
+os.environ['TMPDIR'] = str(custom_temp_dir)
 
 # Global context to hold crawler and supabase client
 @dataclass
@@ -117,6 +131,10 @@ app = FastAPI(
     lifespan=lifespan
 )
 
+mcp = FastApiMCP(app)
+# Mount the MCP server directly to your FastAPI app
+mcp.mount()
+
 # Pydantic models for request/response
 class CrawlSinglePageRequest(BaseModel):
     url: str = Field(..., description="URL of the web page or PDF to crawl")
@@ -142,22 +160,47 @@ def is_pdf_url(url: str) -> bool:
     """Check if a URL points to a PDF file."""
     return url.lower().endswith('.pdf') or 'pdf' in url.lower()
 
-def extract_text_from_pdf_bytes(pdf_bytes: bytes, method: str = "pymupdf") -> str:
+def extract_text_from_pdf_path(pdf_path: str, method: str = "llama_parse") -> str:
     """
-    Extract text from PDF bytes using different methods.
+    Extract text from a PDF file using different methods.
     
     Args:
-        pdf_bytes: The PDF file as bytes
-        method: Either "pymupdf" (default, better) or "pypdf2" (fallback)
+        pdf_path: The path to the PDF file.
+        method: Either "llama_parse" (default), "pymupdf" (fallback) or "pypdf2" (fallback).
     
     Returns:
-        Extracted text as string
+        Extracted text as string.
     """
     text = ""
     
     try:
-        if method == "pymupdf":
+        if method == "llama_parse":
+            try:
+                # Check for LLAMA_CLOUD_API_KEY
+                if not os.getenv("LLAMA_CLOUD_API_KEY"):
+                    print("LLAMA_CLOUD_API_KEY not set. Falling back to PyMuPDF.")
+                    return extract_text_from_pdf_path(pdf_path, "pymupdf")
+                    
+                # --- DEBUGGING: Print temp directory paths ---
+                print(f"TEMP environment variable: {os.getenv('TEMP')}")
+                print(f"TMP environment variable: {os.getenv('TMP')}")
+                print(f"Default temp directory (tempfile.gettempdir()): {tempfile.gettempdir()}")
+                # ----------------------------------------------
+
+                # Parse using LlamaParse
+                text = parse_pdf_to_markdown(pdf_path)
+                    
+                if not text.strip():
+                    raise ValueError("LlamaParse extracted no text. Falling back to PyMuPDF.")
+                
+            except Exception as e:
+                print(f"Error extracting text from PDF using LlamaParse: {e}. Falling back to PyMuPDF.")
+                return extract_text_from_pdf_path(pdf_path, "pymupdf")
+            
+        elif method == "pymupdf":
             # Using PyMuPDF (fitz) - generally better text extraction
+            with open(pdf_path, "rb") as f:
+                pdf_bytes = f.read()
             pdf_document = fitz.open(stream=pdf_bytes, filetype="pdf")
             
             for page_num in range(pdf_document.page_count):
@@ -170,6 +213,8 @@ def extract_text_from_pdf_bytes(pdf_bytes: bytes, method: str = "pymupdf") -> st
             
         elif method == "pypdf2":
             # Using PyPDF2 as fallback
+            with open(pdf_path, "rb") as f:
+                pdf_bytes = f.read()
             pdf_file = BytesIO(pdf_bytes)
             pdf_reader = PyPDF2.PdfReader(pdf_file)
             
@@ -180,9 +225,11 @@ def extract_text_from_pdf_bytes(pdf_bytes: bytes, method: str = "pymupdf") -> st
                 
     except Exception as e:
         print(f"Error extracting text from PDF using {method}: {e}")
-        # If primary method fails, try the other one
-        if method == "pymupdf":
-            return extract_text_from_pdf_bytes(pdf_bytes, "pypdf2")
+        # If primary method fails, try the next one in the fallback chain
+        if method == "llama_parse":
+            return extract_text_from_pdf_path(pdf_path, "pymupdf")
+        elif method == "pymupdf":
+            return extract_text_from_pdf_path(pdf_path, "pypdf2")
         else:
             raise e
     
@@ -195,18 +242,13 @@ async def process_pdf_url(url: str) -> Dict[str, Any]:
     Returns:
         Dict with 'url' and 'markdown' keys, similar to crawler results
     """
+    temp_pdf_path = None
     try:
-        # Download the PDF
-        response = requests.get(url, timeout=30)
-        response.raise_for_status()
-        
-        # Check if it's actually a PDF
-        content_type = response.headers.get('content-type', '').lower()
-        if 'pdf' not in content_type and not url.lower().endswith('.pdf'):
-            raise ValueError(f"URL does not appear to contain a PDF file. Content-Type: {content_type}")
+        # Download the PDF to a temporary file
+        temp_pdf_path = await asyncio.to_thread(download_pdf_to_temp_file, url, custom_temp_dir)
         
         # Extract text from PDF
-        extracted_text = extract_text_from_pdf_bytes(response.content)
+        extracted_text = extract_text_from_pdf_path(temp_pdf_path)
         
         if not extracted_text.strip():
             raise ValueError("No text could be extracted from the PDF")
@@ -221,6 +263,14 @@ async def process_pdf_url(url: str) -> Dict[str, Any]:
         raise ValueError(f"Failed to download PDF: {e}")
     except Exception as e:
         raise ValueError(f"Failed to process PDF: {e}")
+    finally:
+        # Clean up the temporary PDF file
+        if temp_pdf_path and os.path.exists(temp_pdf_path):
+            try:
+                os.remove(temp_pdf_path)
+                print(f"Cleaned up temporary PDF file: {temp_pdf_path}")
+            except Exception as e:
+                print(f"Error cleaning up temporary PDF file {temp_pdf_path}: {e}")
 
 # Helper functions (copied from original MCP server)
 def is_sitemap(url: str) -> bool:
@@ -407,7 +457,7 @@ async def root():
         ]
     }
 
-@app.post("/crawl/single", response_model=APIResponse)
+@app.post("/crawl/single", response_model=APIResponse, operation_id="perform_single_crawl")
 async def crawl_single_page_endpoint(request: CrawlSinglePageRequest):
     """
     Crawl a single web page or PDF and store its content in Supabase.
@@ -502,7 +552,7 @@ async def crawl_single_page_endpoint(request: CrawlSinglePageRequest):
         print(f"Error in crawl_single_page_endpoint: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/crawl/smart", response_model=APIResponse)
+@app.post("/crawl/smart", response_model=APIResponse, operation_id="perform_smart_crawl")
 async def smart_crawl_endpoint(request: SmartCrawlRequest):
     """
     Intelligently crawl a URL based on its type and store content in Supabase.
@@ -602,7 +652,7 @@ async def smart_crawl_endpoint(request: SmartCrawlRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     
-@app.post("/query/rag", response_model=APIResponse)
+@app.post("/query/rag", response_model=APIResponse, operation_id="perform_rag_query")
 async def rag_query_endpoint(request: RAGQueryRequest):
     """
     Perform a RAG (Retrieval Augmented Generation) query on the stored content.
@@ -683,7 +733,7 @@ async def rag_query_endpoint(request: RAGQueryRequest):
         print(f"Error during RAG query: {e}")
         raise HTTPException(status_code=500, detail=f"An error occurred during the RAG query: {str(e)}")
 
-@app.get("/sources", response_model=APIResponse)
+@app.get("/sources", response_model=APIResponse, operation_id="show_all_endpoints")
 async def get_available_sources_endpoint():
     """
     Get all available sources based on unique source metadata values.
@@ -724,6 +774,8 @@ async def get_available_sources_endpoint():
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+    
+mcp.setup_server()
 
 if __name__ == "__main__":
     import uvicorn

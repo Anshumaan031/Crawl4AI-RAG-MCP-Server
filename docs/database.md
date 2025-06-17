@@ -23,6 +23,10 @@ This table stores the crawled web page content, metadata, and embeddings.
 *   `primary key (id)`: The `id` column is the primary key for the table.
 *   `unique(url, chunk_number)`: This unique constraint prevents duplicate chunks for the same URL.
 
+#### Data Handling for Duplicate URLs
+
+When a URL is crawled, either individually or as part of a batch, the application logic in `src/utils.py` ensures that existing data for that specific URL is updated rather than duplicated. Before inserting new content chunks for a URL, any previously stored records associated with that URL in the `crawled_pages` table are deleted. This effectively means that if the same URL is crawled again, its content in the database will be **replaced** with the latest crawled data, preventing redundant entries and maintaining data freshness.
+
 #### Indexes
 
 *   `crawled_pages_embedding_idx`: An index on the `embedding` column using the `ivfflat` algorithm for efficient vector similarity search.

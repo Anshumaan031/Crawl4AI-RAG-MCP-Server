@@ -3,7 +3,7 @@ create extension if not exists vector;
 
 -- Create the documentation chunks table
 create table crawled_pages (
-    id bigserial primary key,
+    id text primary key,
     url varchar not null,
     chunk_number integer not null,
     content text not null,  -- Added content column
@@ -23,13 +23,16 @@ create index idx_crawled_pages_metadata on crawled_pages using gin (metadata);
 
 CREATE INDEX idx_crawled_pages_source ON crawled_pages ((metadata->>'source'));
 
+-- Drop the existing function first to avoid return type conflicts
+DROP FUNCTION IF EXISTS match_crawled_pages(vector, integer, jsonb);
+
 -- Create a function to search for documentation chunks
 create or replace function match_crawled_pages (
   query_embedding vector(1536),
   match_count int default 10,
   filter jsonb DEFAULT '{}'::jsonb
 ) returns table (
-  id bigint,
+  id text,
   url varchar,
   chunk_number integer,
   content text,

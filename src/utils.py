@@ -7,9 +7,19 @@ import json
 from supabase import create_client, Client
 from urllib.parse import urlparse
 import openai
+import uuid
+from datetime import datetime
+import requests
+import tempfile
+from pathlib import Path
 
 # Load OpenAI API key for embeddings
 openai.api_key = os.getenv("OPENAI_API_KEY")
+
+# Imports for semantic chunking
+from llama_index.core.node_parser import SemanticSplitterNodeParser
+from llama_index.core.schema import Document
+from llama_index.llms.gemini import Gemini
 
 def get_supabase_client() -> Client:
     """
@@ -35,6 +45,71 @@ def get_supabase_client() -> Client:
         
         print("Connecting to remote Supabase instance.")
         return create_client(remote_url, remote_key)
+
+def semantic_chunk_text(text: str, chunk_size: int = 1024, chunk_overlap: int = 20) -> List[str]:
+    """
+    Split text into semantically meaningful chunks using LlamaIndex's SemanticSplitterNodeParser.
+    
+    Args:
+        text: The text content to chunk
+        chunk_size: Target chunk size
+        chunk_overlap: Overlap between chunks
+        
+    Returns:
+        List of text chunks preserving semantic meaning
+    """
+    # Check for GOOGLE_API_KEY in env
+    api_key = os.getenv("GOOGLE_API_KEY")
+    if not api_key:
+        print("Warning: GOOGLE_API_KEY not found in environment. Semantic chunking will fail.")
+    
+    # Check for OpenAI API key - needed for embeddings
+    if not openai.api_key:
+        print("Warning: OPENAI_API_KEY not found. Semantic chunking requires embeddings.")
+        # Fall back to standard chunking
+        from utils import smart_chunk_markdown
+        return smart_chunk_markdown(text, chunk_size)
+        
+    # Initialize the LLM for semantic splitting
+    chunking_llm = Gemini(model="models/gemini-1.0-pro", api_key=api_key)
+    
+    try:
+        # Create an embedding model using OpenAI (already imported and set up)
+        from llama_index.embeddings.openai import OpenAIEmbedding
+        embed_model = OpenAIEmbedding(
+            model="text-embedding-3-small",
+            api_key=openai.api_key
+        )
+        
+        # Create the semantic splitter
+        splitter = SemanticSplitterNodeParser(
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+            llm=chunking_llm,
+            embed_model=embed_model
+        )
+        
+        # Create a document from the text
+        document = Document(text=text)
+        
+        # Parse the document into nodes
+        nodes = splitter.get_nodes_from_documents([document])
+        
+        # Extract text from each node
+        chunks = [node.text for node in nodes]
+        
+        if not chunks:
+            print("Warning: Semantic chunking produced no chunks. Falling back to standard chunking.")
+            from utils import smart_chunk_markdown
+            return smart_chunk_markdown(text, chunk_size)
+        
+        return chunks
+        
+    except Exception as e:
+        print(f"Error during semantic chunking: {e}. Falling back to standard chunking.")
+        # Fall back to the standard chunking method if semantic chunking fails
+        from utils import smart_chunk_markdown
+        return smart_chunk_markdown(text, chunk_size)
 
 def create_embeddings_batch(texts: List[str]) -> List[List[float]]:
     """
@@ -131,11 +206,16 @@ def add_documents_to_supabase(
         
         batch_data = []
         for j in range(len(batch_contents)):
+            # Generate a unique ID for the document
+            # Using a combination of UUID and timestamp to ensure uniqueness
+            unique_id = f"{datetime.now().strftime('%Y%m%d%H%M%S%f')}-{uuid.uuid4()}"
+
             # Extract metadata fields
             chunk_size = len(batch_contents[j])
             
             # Prepare data for insertion
             data = {
+                "id": unique_id, # Include the generated unique ID
                 "url": batch_urls[j],
                 "chunk_number": batch_chunk_numbers[j],
                 "content": batch_contents[j],
@@ -193,3 +273,42 @@ def search_documents(
     except Exception as e:
         print(f"Error searching documents: {e}")
         return []
+
+def download_pdf_to_temp_file(url: str, temp_dir: Path) -> str:
+    """
+    Downloads a PDF from a URL to a temporary file and returns its path.
+
+    Args:
+        url (str): The URL of the PDF file.
+        temp_dir (Path): The directory where the temporary file should be stored.
+
+    Returns:
+        str: The path to the downloaded temporary PDF file.
+
+    Raises:
+        requests.exceptions.RequestException: If the download fails.
+        ValueError: If the downloaded content is not a PDF.
+    """
+    try:
+        response = requests.get(url, timeout=30)
+        response.raise_for_status()
+
+        content_type = response.headers.get('content-type', '').lower()
+        if 'pdf' not in content_type and not url.lower().endswith('.pdf'):
+            raise ValueError(f"URL does not appear to contain a PDF file. Content-Type: {content_type}")
+
+        # Create a temporary file to save the PDF bytes
+        # The delete=False is used because we need the file to persist for LlamaParse
+        # and we'll manually delete it later.
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf", dir=temp_dir) as tmp_file:
+            tmp_file.write(response.content)
+            temp_pdf_path = tmp_file.name
+        
+        return temp_pdf_path
+
+    except requests.exceptions.RequestException as e:
+        raise requests.exceptions.RequestException(f"Failed to download PDF from {url}: {e}")
+    except ValueError as e:
+        raise ValueError(f"Invalid content type for {url}: {e}")
+    except Exception as e:
+        raise Exception(f"An unexpected error occurred during PDF download: {e}")
