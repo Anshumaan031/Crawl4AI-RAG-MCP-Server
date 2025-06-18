@@ -6,7 +6,7 @@ Now includes support for processing PDF files directly.
 """
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Literal
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from urllib.parse import urlparse, urldefrag
@@ -32,8 +32,16 @@ from pdf_parser import parse_pdf_to_markdown # Import LlamaParse utility
 
 from llama_index.llms.gemini import Gemini
 
+# Load environment variables from the project root .env file
+project_root = Path(__file__).resolve().parent.parent
+dotenv_path = project_root / '.env'
+
+# Force override of existing environment variables
+load_dotenv(dotenv_path, override=True)
+
 # Get API key from environment variables instead of hardcoding
 gemini_api_key = os.getenv("GEMINI_API_KEY")
+print(f"Debug - GEMINI_API_KEY loaded: {'[present but hidden]' if gemini_api_key else '[not found]'}")
 if not gemini_api_key:
     print("Warning: GEMINI_API_KEY not found in environment variables. Using default value.")
     gemini_api_key = "YOUR_API_KEY" # Replace with placeholder instead of real key
@@ -44,18 +52,11 @@ llm = Gemini(
 )
 
 from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig, CacheMode, MemoryAdaptiveDispatcher
-from utils import get_supabase_client, add_documents_to_supabase, search_documents, download_pdf_to_temp_file
+from utils import get_supabase_client, add_documents_to_supabase, search_documents, download_pdf_to_temp_file, semantic_chunk_text
 
 # Windows-specific asyncio fix
 if platform.system() == "Windows":
     asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
-
-# Load environment variables from the project root .env file
-project_root = Path(__file__).resolve().parent.parent
-dotenv_path = project_root / '.env'
-
-# Force override of existing environment variables
-load_dotenv(dotenv_path, override=True)
 
 # Set a custom temporary directory within the project root
 custom_temp_dir = project_root / "temp"
@@ -138,12 +139,15 @@ mcp.mount()
 # Pydantic models for request/response
 class CrawlSinglePageRequest(BaseModel):
     url: str = Field(..., description="URL of the web page or PDF to crawl")
+    chunking_method: Literal["standard", "semantic"] = Field("standard", description="Chunking method to use: standard (rule-based) or semantic (AI-based)")
+    chunk_size: int = Field(5000, description="Maximum size of each content chunk in characters")
 
 class SmartCrawlRequest(BaseModel):
     url: str = Field(..., description="URL to crawl (can be a regular webpage, sitemap.xml, .txt file, or PDF)")
     max_depth: int = Field(3, description="Maximum recursion depth for regular URLs")
     max_concurrent: int = Field(10, description="Maximum number of concurrent browser sessions")
     chunk_size: int = Field(5000, description="Maximum size of each content chunk in characters")
+    chunking_method: Literal["standard", "semantic"] = Field("standard", description="Chunking method to use: standard (rule-based) or semantic (AI-based)")
 
 class RAGQueryRequest(BaseModel):
     query: str = Field(..., description="The search query")
@@ -465,6 +469,8 @@ async def crawl_single_page_endpoint(request: CrawlSinglePageRequest):
     This endpoint now supports both web pages and PDF files. For PDFs, it will
     download and extract the text content. The content is stored in Supabase
     for later retrieval and querying.
+    
+    You can choose between standard (rule-based) or semantic (AI-based) chunking.
     """
     print("Crawling single page/PDF:", request.url)
     if not app_context:
@@ -504,8 +510,13 @@ async def crawl_single_page_endpoint(request: CrawlSinglePageRequest):
             # Robustly clean the markdown content before chunking
             cleaned_markdown = content_result['markdown'].encode('utf-8', errors='ignore').decode('utf-8')
             
-            # Chunk the content
-            chunks = smart_chunk_markdown(cleaned_markdown)
+            # Choose chunking method based on user request
+            if request.chunking_method == "semantic":
+                print("Using semantic chunking...")
+                chunks = semantic_chunk_text(cleaned_markdown, chunk_size=request.chunk_size)
+            else:
+                print("Using standard chunking...")
+                chunks = smart_chunk_markdown(cleaned_markdown, chunk_size=request.chunk_size)
             
             # Prepare data for Supabase
             urls = []
@@ -524,6 +535,7 @@ async def crawl_single_page_endpoint(request: CrawlSinglePageRequest):
                 meta["url"] = request.url
                 meta["source"] = urlparse(request.url).netloc
                 meta["content_type"] = content_type
+                meta["chunking_method"] = request.chunking_method
                 meta["crawl_time"] = str(asyncio.current_task().get_coro().__name__)
                 metadatas.append(meta)
             
@@ -535,6 +547,7 @@ async def crawl_single_page_endpoint(request: CrawlSinglePageRequest):
                 data={
                     "url": request.url,
                     "content_type": content_type,
+                    "chunking_method": request.chunking_method,
                     "chunks_stored": len(chunks),
                     "content_length": len(content_result['markdown']),
                     "links_count": {
@@ -564,6 +577,8 @@ async def smart_crawl_endpoint(request: SmartCrawlRequest):
     - For regular webpages: Recursively crawls internal links up to the specified depth
     
     All crawled content is chunked and stored in Supabase for later retrieval and querying.
+    
+    You can choose between standard (rule-based) or semantic (AI-based) chunking methods.
     """
     if not app_context:
         raise HTTPException(status_code=500, detail="Application context not initialized")
@@ -616,7 +631,14 @@ async def smart_crawl_endpoint(request: SmartCrawlRequest):
         for doc in crawl_results:
             source_url = doc['url']
             md = doc['markdown']
-            chunks = smart_chunk_markdown(md, chunk_size=request.chunk_size)
+            
+            # Choose chunking method based on user request
+            if request.chunking_method == "semantic":
+                print(f"Using semantic chunking for {source_url}...")
+                chunks = semantic_chunk_text(md, chunk_size=request.chunk_size)
+            else:
+                print(f"Using standard chunking for {source_url}...")
+                chunks = smart_chunk_markdown(md, chunk_size=request.chunk_size)
             
             for i, chunk in enumerate(chunks):
                 urls.append(source_url)
@@ -630,6 +652,7 @@ async def smart_crawl_endpoint(request: SmartCrawlRequest):
                 meta["source"] = urlparse(source_url).netloc
                 meta["crawl_type"] = crawl_type
                 meta["content_type"] = doc.get('content_type', 'webpage')
+                meta["chunking_method"] = request.chunking_method
                 meta["crawl_time"] = str(asyncio.current_task().get_coro().__name__)
                 metadatas.append(meta)
                 
@@ -644,6 +667,7 @@ async def smart_crawl_endpoint(request: SmartCrawlRequest):
             data={
                 "url": request.url,
                 "crawl_type": crawl_type,
+                "chunking_method": request.chunking_method,
                 "pages_crawled": len(crawl_results),
                 "chunks_stored": chunk_count,
                 "urls_crawled": [doc['url'] for doc in crawl_results][:5] + (["..."] if len(crawl_results) > 5 else [])

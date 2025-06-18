@@ -71,7 +71,7 @@ def semantic_chunk_text(text: str, chunk_size: int = 1024, chunk_overlap: int = 
         return smart_chunk_markdown(text, chunk_size)
         
     # Initialize the LLM for semantic splitting
-    chunking_llm = Gemini(model="models/gemini-1.0-pro", api_key=api_key)
+    chunking_llm = Gemini(model="models/gemini-2.0-flash", api_key=api_key)
     
     try:
         # Create an embedding model using OpenAI (already imported and set up)
